@@ -1,0 +1,7 @@
+DejaVu Sans fonts (Regular, Bold, Oblique) bundled here so PDF invoices
+render the Indian Rupee sign (₹) correctly on any server, regardless of
+what fonts happen to be installed on that machine.
+
+Based on Bitstream Vera, released under a permissive free license that
+allows redistribution and embedding. Full text:
+https://dejavu-fonts.github.io/License.html
