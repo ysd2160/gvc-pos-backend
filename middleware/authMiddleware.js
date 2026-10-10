@@ -11,6 +11,12 @@ export const protect = asyncHandler(async (req, res, next) => {
       token = req.headers.authorization.split(" ")[1];
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+      // Enforce 8-hour absolute maximum lifetime
+      if (decoded.maxExpiry && Date.now() > decoded.maxExpiry) {
+        res.status(401);
+        throw new Error("Session expired (8-hour maximum lifetime reached). Please log in again.");
+      }
+
       req.user = await User.findById(decoded.id).select("-password");
 
       if (!req.user || !req.user.isActive) {
@@ -18,10 +24,19 @@ export const protect = asyncHandler(async (req, res, next) => {
         throw new Error("Not authorized, user not found or inactive");
       }
 
+      // Enforce server-side token invalidation on logout
+      if (req.user.lastLogoutAt) {
+        const tokenIssuedAt = (decoded.iat || 0) * 1000;
+        if (tokenIssuedAt < new Date(req.user.lastLogoutAt).getTime()) {
+          res.status(401);
+          throw new Error("Session has been logged out. Please log in again.");
+        }
+      }
+
       next();
     } catch (error) {
       res.status(401);
-      throw new Error("Not authorized, token failed");
+      throw new Error(error.message || "Not authorized, token failed");
     }
   } else {
     res.status(401);

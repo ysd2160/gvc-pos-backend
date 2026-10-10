@@ -8,9 +8,12 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6 },
     role: { type: String, enum: ["admin", "staff"], default: "staff" },
     isActive: { type: Boolean, default: true },
+    lastLogoutAt: { type: Date },
   },
   { timestamps: true }
 );
+
+userSchema.index({ isActive: 1 });
 
 // Hash password before saving
 userSchema.pre("save", async function (next) {

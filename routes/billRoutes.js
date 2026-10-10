@@ -1,4 +1,5 @@
 import express from "express";
+import mongoose from "mongoose";
 import asyncHandler from "express-async-handler";
 import Bill from "../models/Bill.js";
 import Product from "../models/Product.js";
@@ -10,6 +11,7 @@ import { buildDateFilter } from "../utils/dateRange.js";
 import { buildReceiptEscPos } from "../utils/escposReceipt.js";
 import { computeBill, BillError } from "../utils/billCalc.js";
 import { getShop } from "../config/shop.js";
+import { serverCache } from "../utils/cache.js";
 
 const router = express.Router();
 
@@ -46,11 +48,44 @@ router.post(
   protect,
   asyncHandler(async (req, res) => {
     const shop = getShop();
-    const { customerName, customerPhone, items, discount, payments, notes, orderType, tableNo } = req.body;
+    const {
+      customerName,
+      customerPhone,
+      items,
+      discount,
+      payments,
+      notes,
+      orderChannel,
+      orderType,
+      tableNo,
+      idempotencyKey,
+    } = req.body;
+
+    // Idempotency check: prevent duplicate submissions
+    if (idempotencyKey) {
+      const existingBill = await Bill.findOne({ idempotencyKey }).populate("createdBy", "name");
+      if (existingBill) {
+        return res.status(200).json(existingBill);
+      }
+    }
 
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400);
       throw new Error("Bill must have at least one item");
+    }
+
+    // Determine normalized order channel
+    const validChannels = ["Dine In", "Takeaway", "Swiggy", "Zomato"];
+    let selectedChannel = orderChannel;
+    if (!selectedChannel) {
+      if (orderType === "Dine-in" || orderType === "Dine In") selectedChannel = "Dine In";
+      else if (orderType === "Takeaway") selectedChannel = "Takeaway";
+      else selectedChannel = "Dine In";
+    } else if (selectedChannel === "Dine-in") {
+      selectedChannel = "Dine In";
+    }
+    if (!validChannels.includes(selectedChannel)) {
+      selectedChannel = "Dine In";
     }
 
     // Same product do baar aaye to quantity jod do (stock check sahi rahe)
@@ -64,10 +99,14 @@ router.post(
       merged.set(String(item.productId), (merged.get(String(item.productId)) || 0) + qty);
     }
 
-    // Step 1: products + stock validate (kuch bhi change karne se pehle)
+    // Step 1: Batch fetch all products (eliminates N+1 query issue)
+    const productIds = Array.from(merged.keys());
+    const products = await Product.find({ _id: { $in: productIds } });
+    const productMap = new Map(products.map((p) => [p._id.toString(), p]));
+
     const lines = [];
     for (const [productId, quantity] of merged) {
-      const product = await Product.findById(productId);
+      const product = productMap.get(productId);
       if (!product) {
         res.status(400);
         throw new Error(`Product not found (it may have been deleted): ${productId}`);
@@ -83,10 +122,10 @@ router.post(
       lines.push({ product, quantity });
     }
 
-    // Step 2: totals, GST (sirf jis shop mein on hai), payments, cash change
+    // Step 2: Server-authoritative totals, GST, payments, cash change for selected channel
     let calc;
     try {
-      calc = computeBill({ lines, discount, payments, shop });
+      calc = computeBill({ lines, discount, payments, shop, channel: selectedChannel });
     } catch (err) {
       if (err instanceof BillError) res.status(400);
       throw err;
@@ -94,36 +133,75 @@ router.post(
 
     const billNumber = await getNextBillNumber(shop);
 
-    // Step 3: bill save
-    const cleanOrderType = ["Dine-in", "Takeaway"].includes(orderType) ? orderType : "";
-    const bill = await Bill.create({
-      billNumber,
-      customerName: customerName || "Walk-in Customer",
-      customerPhone: customerPhone || "",
-      ...calc,
-      orderType: cleanOrderType,
-      tableNo: cleanOrderType === "Dine-in" ? String(tableNo || "").trim().slice(0, 10) : "",
-      createdBy: req.user._id,
-      notes: notes || "",
-    });
-
-    // Step 4: stock minus (sirf tracked products ka)
-    for (const { product, quantity } of lines) {
-      if (product.trackStock === false) continue;
-      product.quantity -= quantity;
-      await product.save();
-
-      await StockLog.create({
-        product: product._id,
-        type: "OUT",
-        quantity,
-        reason: "Sold via bill",
-        relatedBill: bill._id,
-        performedBy: req.user._id,
-      });
+    // Step 3 & 4: Transaction support for bill creation and stock deduction
+    let dbSession = null;
+    try {
+      dbSession = await mongoose.startSession();
+      dbSession.startTransaction();
+    } catch (sessionErr) {
+      // Standalone mongod fallback if replica set transactions not supported
+      dbSession = null;
     }
 
-    res.status(201).json(bill);
+    try {
+      const billData = {
+        billNumber,
+        customerName: customerName || "Walk-in Customer",
+        customerPhone: customerPhone || "",
+        ...calc,
+        orderChannel: selectedChannel,
+        orderType: selectedChannel === "Dine In" ? "Dine-in" : selectedChannel,
+        tableNo: selectedChannel === "Dine In" ? String(tableNo || "").trim().slice(0, 10) : "",
+        createdBy: req.user._id,
+        notes: notes || "",
+      };
+      if (idempotencyKey) {
+        billData.idempotencyKey = idempotencyKey;
+      }
+
+      const billArr = await Bill.create([billData], dbSession ? { session: dbSession } : undefined);
+      const bill = billArr[0];
+
+      // Stock minus (sirf tracked products ka)
+      for (const { product, quantity } of lines) {
+        if (product.trackStock === false) continue;
+        product.quantity -= quantity;
+        await product.save(dbSession ? { session: dbSession } : undefined);
+
+        await StockLog.create(
+          [
+            {
+              product: product._id,
+              type: "OUT",
+              quantity,
+              reason: "Sold via bill",
+              relatedBill: bill._id,
+              performedBy: req.user._id,
+            },
+          ],
+          dbSession ? { session: dbSession } : undefined
+        );
+      }
+
+      if (dbSession) {
+        await dbSession.commitTransaction();
+      }
+
+      // Invalidate relevant server caches
+      serverCache.invalidatePrefix("reports:");
+      serverCache.invalidatePrefix("products:");
+
+      res.status(201).json(bill);
+    } catch (err) {
+      if (dbSession) {
+        await dbSession.abortTransaction();
+      }
+      throw err;
+    } finally {
+      if (dbSession) {
+        dbSession.endSession();
+      }
+    }
   })
 );
 

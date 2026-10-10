@@ -5,10 +5,12 @@ import Product from "../models/Product.js";
 import { protect, authorize } from "../middleware/authMiddleware.js";
 import { buildDateFilter } from "../utils/dateRange.js";
 
+import { serverCache } from "../utils/cache.js";
+
 const router = express.Router();
 
 // @route   GET /api/reports/sales-summary?from=&to=
-// @desc    Total sales, bill count, avg bill value in a date range
+// @desc    Total sales, bill count, avg bill value, and order channel breakdown in a date range
 // @access  Private/Admin
 router.get(
   "/sales-summary",
@@ -16,8 +18,13 @@ router.get(
   authorize("admin"),
   asyncHandler(async (req, res) => {
     const { from, to } = req.query;
-    const filter = buildDateFilter(from, to);
+    const cacheKey = `reports:sales-summary:${from || ""}:${to || ""}`;
+    const cached = serverCache.get(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
 
+    const filter = buildDateFilter(from, to);
     const bills = await Bill.find(filter);
 
     const totalSales = bills.reduce((sum, b) => sum + b.grandTotal, 0);
@@ -26,10 +33,17 @@ router.get(
     const totalDiscount = bills.reduce((sum, b) => sum + b.discount, 0);
     const avgBillValue = totalBills > 0 ? totalSales / totalBills : 0;
 
-    // Day-wise breakdown.
-    // Group by the IST calendar day (not UTC) — otherwise a bill made just
-    // after midnight IST (e.g. 1:07 AM) lands in UTC's *previous* day and
-    // shows up under the wrong date.
+    // Order Channel Breakdown: Dine In, Takeaway, Swiggy, Zomato
+    const channelWise = { "Dine In": 0, "Takeaway": 0, "Swiggy": 0, "Zomato": 0 };
+    const channelCounts = { "Dine In": 0, "Takeaway": 0, "Swiggy": 0, "Zomato": 0 };
+
+    bills.forEach((b) => {
+      const ch = b.orderChannel || (b.orderType === "Dine-in" ? "Dine In" : b.orderType) || "Dine In";
+      channelWise[ch] = (channelWise[ch] || 0) + b.grandTotal;
+      channelCounts[ch] = (channelCounts[ch] || 0) + 1;
+    });
+
+    // Day-wise breakdown IST
     const dayWise = {};
     bills.forEach((b) => {
       const istDate = new Date(new Date(b.createdAt).getTime() + 5.5 * 60 * 60 * 1000);
@@ -37,14 +51,19 @@ router.get(
       dayWise[day] = (dayWise[day] || 0) + b.grandTotal;
     });
 
-    res.json({
+    const result = {
       totalSales,
       totalGstCollected,
       totalBills,
       totalDiscount,
       avgBillValue,
+      channelWise,
+      channelCounts,
       dayWise,
-    });
+    };
+
+    serverCache.set(cacheKey, result, 30); // 30s TTL
+    res.json(result);
   })
 );
 
@@ -101,13 +120,15 @@ router.get(
     const grossProfit = totalRevenue - totalCost;
     const profitMargin = totalRevenue > 0 ? (grossProfit / totalRevenue) * 100 : 0;
 
-    res.json({
+    const result = {
       totalRevenue,
       totalCost,
       grossProfit,
       profitMargin,
       productWise,
-    });
+    };
+    serverCache.set(`reports:profit-loss:${from || ""}:${to || ""}`, result, 30);
+    res.json(result);
   })
 );
 
@@ -120,8 +141,11 @@ router.get(
   authorize("admin"),
   asyncHandler(async (req, res) => {
     const { from, to } = req.query;
-    const filter = buildDateFilter(from, to);
+    const cacheKey = `reports:payments:${from || ""}:${to || ""}`;
+    const cached = serverCache.get(cacheKey);
+    if (cached) return res.json(cached);
 
+    const filter = buildDateFilter(from, to);
     const bills = await Bill.find(filter);
 
     const modeWise = { Cash: 0, UPI: 0, Card: 0, Credit: 0 };
@@ -144,11 +168,13 @@ router.get(
         createdAt: b.createdAt,
       }));
 
-    res.json({
+    const result = {
       modeWise,
       totalPending,
       pendingBills,
-    });
+    };
+    serverCache.set(cacheKey, result, 30);
+    res.json(result);
   })
 );
 
@@ -160,6 +186,10 @@ router.get(
   authorize("admin"),
   asyncHandler(async (req, res) => {
     const { from, to, limit } = req.query;
+    const cacheKey = `reports:top-products:${from || ""}:${to || ""}:${limit || 10}`;
+    const cached = serverCache.get(cacheKey);
+    if (cached) return res.json(cached);
+
     const filter = buildDateFilter(from, to);
     const bills = await Bill.find(filter);
 
@@ -177,6 +207,7 @@ router.get(
       .sort((a, b) => b.quantitySold - a.quantitySold)
       .slice(0, Number(limit) || 10);
 
+    serverCache.set(cacheKey, sorted, 30);
     res.json(sorted);
   })
 );

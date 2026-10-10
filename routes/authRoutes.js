@@ -6,8 +6,14 @@ import { protect, authorize } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "1d" });
+const generateToken = (user) => {
+  const maxExpiry = Date.now() + 8 * 60 * 60 * 1000; // 8 hours
+  const token = jwt.sign(
+    { id: user._id, role: user.role, maxExpiry },
+    process.env.JWT_SECRET,
+    { expiresIn: "8h" }
+  );
+  return { token, expiresAt: maxExpiry };
 };
 
 // @route   POST /api/auth/login
@@ -34,13 +40,29 @@ router.post(
       throw new Error("Your account has been deactivated. Contact admin.");
     }
 
+    const { token, expiresAt } = generateToken(user);
+
     res.json({
       _id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
-      token: generateToken(user._id),
+      token,
+      expiresAt,
     });
+  })
+);
+
+// @route   POST /api/auth/logout
+// @desc    Invalidates current session on the backend
+// @access  Private
+router.post(
+  "/logout",
+  protect,
+  asyncHandler(async (req, res) => {
+    req.user.lastLogoutAt = new Date();
+    await req.user.save();
+    res.json({ message: "Logged out successfully" });
   })
 );
 

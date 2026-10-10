@@ -123,6 +123,8 @@ export const generateBillPDF = (bill, res, shop) => {
   doc.font("Body").fontSize(9).fillColor(TEXT_MUTED);
   doc.text(`Invoice No.: ${bill.billNumber}`, PAGE_LEFT + 300, y, { width: 215, align: "right" });
   doc.text(`Date: ${formatDateIST(bill.createdAt)}`, PAGE_LEFT + 300, doc.y, { width: 215, align: "right" });
+  const ch = bill.orderChannel || bill.orderType || "Dine In";
+  doc.text(`Channel: ${ch}${bill.tableNo ? ` (Table ${bill.tableNo})` : ""}`, PAGE_LEFT + 300, doc.y, { width: 215, align: "right" });
 
   let bottomLeftY = doc.y;
   if (bill.customerPhone) {

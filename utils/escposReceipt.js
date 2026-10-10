@@ -96,8 +96,9 @@ export const buildReceiptEscPos = async (bill, shop) => {
   chunks.push(CMD.alignLeft);
   chunks.push(line(`Bill No: ${bill.billNumber}`));
   chunks.push(line(`Date: ${formatDateTimeIST(bill.createdAt)}`));
-  if (bill.orderType) {
-    chunks.push(line(`Order: ${bill.orderType}${bill.tableNo ? `  Table: ${bill.tableNo}` : ""}`));
+  const ch = bill.orderChannel || bill.orderType;
+  if (ch) {
+    chunks.push(line(`Channel: ${ch}${bill.tableNo ? `  Table: ${bill.tableNo}` : ""}`));
   }
   if (bill.customerName && bill.customerName !== "Walk-in Customer") {
     chunks.push(line(`Customer: ${bill.customerName}`));

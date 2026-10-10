@@ -4,23 +4,32 @@ import Product from "../models/Product.js";
 import StockLog from "../models/StockLog.js";
 import { protect, authorize } from "../middleware/authMiddleware.js";
 import { getShop } from "../config/shop.js";
+import { serverCache } from "../utils/cache.js";
 
 const router = express.Router();
 
+const DEFAULT_CHANNELS = ["Dine In", "Takeaway", "Swiggy", "Zomato"];
+
 // @route   GET /api/products
-// @desc    Get all products (both admin & staff can view, needed for billing)
+// @desc    Get all active canonical products (excludes reconciled duplicates)
 // @access  Private
 router.get(
   "/",
   protect,
   asyncHandler(async (req, res) => {
     const { search, category, lowStock } = req.query;
-    const filter = { isActive: true };
+    const cacheKey = `products:${search || ""}:${category || ""}:${lowStock || ""}`;
+    const cached = serverCache.get(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const filter = { isActive: true, isReconciledDuplicate: { $ne: true } };
 
     if (search) {
       filter.name = { $regex: search, $options: "i" };
     }
-    if (category) {
+    if (category && category !== "All") {
       filter.category = category;
     }
 
@@ -30,6 +39,7 @@ router.get(
       products = products.filter((p) => p.trackStock !== false && p.quantity <= p.lowStockThreshold);
     }
 
+    serverCache.set(cacheKey, products, 60); // 60s TTL
     res.json(products);
   })
 );
@@ -50,19 +60,59 @@ router.get(
 );
 
 // @route   POST /api/products
-// @desc    Add new product
+// @desc    Add new product with channel-based pricing
 // @access  Private/Admin
 router.post(
   "/",
   protect,
   authorize("admin"),
   asyncHandler(async (req, res) => {
-    const { name, category, hsn, unit, costPrice, sellingPrice, gstPercent, quantity, lowStockThreshold, trackStock } = req.body;
-    const gstOn = getShop().gstEnabled; // cafe mein GST/HSN store hi nahi hoga
+    const {
+      name,
+      category,
+      hsn,
+      unit,
+      costPrice,
+      sellingPrice,
+      channelPrices,
+      gstPercent,
+      quantity,
+      lowStockThreshold,
+      trackStock,
+    } = req.body;
+    const gstOn = getShop().gstEnabled;
 
-    if (!name || costPrice == null || sellingPrice == null) {
+    if (!name || costPrice == null) {
       res.status(400);
-      throw new Error("Name, cost price and selling price are required");
+      throw new Error("Name and cost price are required");
+    }
+
+    // Determine prices
+    let normalizedChannelPrices = [];
+    let baseSellingPrice = Number(sellingPrice);
+
+    if (Array.isArray(channelPrices) && channelPrices.length > 0) {
+      normalizedChannelPrices = channelPrices.map((cp) => ({
+        channel: cp.channel?.trim(),
+        price: Number(cp.price) || 0,
+      }));
+      const dineInCp = normalizedChannelPrices.find(
+        (cp) => cp.channel.toLowerCase() === "dine in" || cp.channel.toLowerCase() === "dine-in"
+      );
+      if (dineInCp) {
+        baseSellingPrice = dineInCp.price;
+      } else if (isNaN(baseSellingPrice) || baseSellingPrice <= 0) {
+        baseSellingPrice = normalizedChannelPrices[0].price;
+      }
+    } else {
+      if (sellingPrice == null) {
+        res.status(400);
+        throw new Error("Selling price or channel prices are required");
+      }
+      normalizedChannelPrices = DEFAULT_CHANNELS.map((ch) => ({
+        channel: ch,
+        price: baseSellingPrice,
+      }));
     }
 
     const tracked = trackStock !== false && trackStock !== "false";
@@ -72,7 +122,8 @@ router.post(
       hsn: gstOn ? hsn : "",
       unit,
       costPrice,
-      sellingPrice,
+      sellingPrice: baseSellingPrice,
+      channelPrices: normalizedChannelPrices,
       gstPercent: gstOn ? gstPercent || 0 : 0,
       trackStock: tracked,
       quantity: tracked ? quantity || 0 : 0,
@@ -90,12 +141,13 @@ router.post(
       });
     }
 
+    serverCache.invalidatePrefix("products:");
     res.status(201).json(product);
   })
 );
 
 // @route   PUT /api/products/:id
-// @desc    Update product details (not stock quantity directly - use /stock endpoint)
+// @desc    Update product details including channel prices
 // @access  Private/Admin
 router.put(
   "/:id",
@@ -108,7 +160,19 @@ router.put(
       throw new Error("Product not found");
     }
 
-    const { name, category, hsn, unit, costPrice, sellingPrice, gstPercent, lowStockThreshold, isActive, trackStock } = req.body;
+    const {
+      name,
+      category,
+      hsn,
+      unit,
+      costPrice,
+      sellingPrice,
+      channelPrices,
+      gstPercent,
+      lowStockThreshold,
+      isActive,
+      trackStock,
+    } = req.body;
     const gstOn = getShop().gstEnabled;
 
     if (name !== undefined) product.name = name;
@@ -117,12 +181,27 @@ router.put(
     if (unit !== undefined) product.unit = unit;
     if (costPrice !== undefined) product.costPrice = costPrice;
     if (sellingPrice !== undefined) product.sellingPrice = sellingPrice;
+
+    if (Array.isArray(channelPrices) && channelPrices.length > 0) {
+      product.channelPrices = channelPrices.map((cp) => ({
+        channel: cp.channel?.trim(),
+        price: Number(cp.price) || 0,
+      }));
+      const dineInCp = product.channelPrices.find(
+        (cp) => cp.channel.toLowerCase() === "dine in" || cp.channel.toLowerCase() === "dine-in"
+      );
+      if (dineInCp) {
+        product.sellingPrice = dineInCp.price;
+      }
+    }
+
     if (gstPercent !== undefined && gstOn) product.gstPercent = gstPercent;
     if (trackStock !== undefined) product.trackStock = trackStock !== false && trackStock !== "false";
     if (lowStockThreshold !== undefined) product.lowStockThreshold = lowStockThreshold;
     if (isActive !== undefined) product.isActive = isActive;
 
     const updated = await product.save();
+    serverCache.invalidatePrefix("products:");
     res.json(updated);
   })
 );
@@ -168,6 +247,7 @@ router.patch(
       performedBy: req.user._id,
     });
 
+    serverCache.invalidatePrefix("products:");
     res.json(product);
   })
 );
@@ -187,6 +267,7 @@ router.delete(
     }
     product.isActive = false;
     await product.save();
+    serverCache.invalidatePrefix("products:");
     res.json({ message: "Product removed" });
   })
 );

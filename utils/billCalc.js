@@ -14,12 +14,19 @@ const MODES = ["Cash", "UPI", "Card"];
  *           [] / list  -> jaisa diya waisa ([{mode, amount, received?}])
  * shop:     shop config ({ gstEnabled })
  */
-export const computeBill = ({ lines, discount, payments, shop }) => {
+export const computeBill = ({ lines, discount, payments, shop, channel = "Dine In" }) => {
   let subtotal = 0;
   let totalGst = 0;
 
-  const items = lines.map(({ product, quantity }) => {
-    const lineTotal = round2(product.sellingPrice * quantity);
+  const items = lines.map(({ product, quantity, channelPrice }) => {
+    let price = channelPrice;
+    if (price == null) {
+      price = typeof product.getPriceForChannel === "function"
+        ? product.getPriceForChannel(channel)
+        : (product.sellingPrice || 0);
+    }
+    price = round2(price);
+    const lineTotal = round2(price * quantity);
     // GST sirf tab jab shop mein enabled ho (Frozetto). Cafe mein hamesha 0.
     const gstPercent = shop.gstEnabled ? product.gstPercent || 0 : 0;
     const gstAmount = round2((lineTotal * gstPercent) / 100);
@@ -31,7 +38,7 @@ export const computeBill = ({ lines, discount, payments, shop }) => {
       hsn: shop.gstEnabled ? product.hsn || "" : "",
       unit: product.unit,
       quantity,
-      price: product.sellingPrice,
+      price,
       gstPercent,
       lineTotal,
       gstAmount,
