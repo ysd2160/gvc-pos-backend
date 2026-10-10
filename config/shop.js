@@ -27,7 +27,7 @@ export const getShop = () => {
     logoFile: "logo.png", // backend/assets/logos/logo.png
     footer: e.SHOP_FOOTER || "Thank you! Visit again",
     // Bill kaise dena hai
-    output: { thermal: true, pdf: false, whatsapp: false },
+    output: { thermal: true, pdf: true, whatsapp: true },
   };
 };
 
